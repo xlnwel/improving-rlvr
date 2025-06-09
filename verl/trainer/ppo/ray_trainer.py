@@ -39,23 +39,22 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.base import Worker
-from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray import (RayClassWithInitArgs, RayResourcePool,
+                                        RayWorkerGroup)
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
-from verl.trainer.ppo.metric_utils import (
-    compute_data_metrics,
-    compute_throughout_metrics,
-    compute_timing_metrics,
-    process_validation_metrics,
-)
+from verl.trainer.ppo.metric_utils import (compute_data_metrics,
+                                           compute_throughout_metrics,
+                                           compute_timing_metrics,
+                                           process_validation_metrics)
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.utils.checkpoint.checkpoint_manager import BaseCheckpointManager, find_latest_ckpt_path
+from verl.utils.checkpoint.checkpoint_manager import (BaseCheckpointManager,
+                                                      find_latest_ckpt_path)
 from verl.utils.debug.performance import _timer
-from verl.utils.metric import (
-    reduce_metrics,
-)
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.metric import reduce_metrics
+from verl.utils.seqlen_balancing import (get_seqlen_balanced_partitions,
+                                         log_seqlen_unbalance)
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
@@ -529,7 +528,8 @@ class RayPPOTrainer:
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+            from verl.utils.dataset.rl_dataset import \
+                collate_fn as default_collate_fn
 
             collate_fn = default_collate_fn
 
@@ -635,8 +635,10 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
 
+        print(f'val_dataset: {len(self.val_dataset)}')
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
+            print(f'{len(test_batch)=}')
 
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
@@ -698,6 +700,7 @@ class RayPPOTrainer:
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
+            print(f"{len(scores)=}")
 
             reward_extra_infos_dict["reward"].extend(scores)
             if "reward_extra_info" in result:
@@ -719,6 +722,8 @@ class RayPPOTrainer:
                 dump_path=val_data_dir,
             )
 
+        for k, ls in reward_extra_infos_dict.items():
+            print(k, len(ls))
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 

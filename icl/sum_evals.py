@@ -34,29 +34,40 @@ def pretty_print(output_path, data):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="")
+    parser.add_argument("--model", "-m", type=str, default="Qwen3")
     parser.add_argument("--output_dir", "-o", type=str, default="icl/results/n=8-k=8")
     return parser.parse_args()
 
 if __name__ == '__main__':
     args = parse_args()
+    model = args.model
     output_dir = args.output_dir
-    files = glob.glob(f"{output_dir}/Qwen3*/*jsonl")
+    files = glob.glob(f"{output_dir}/{model}*/*jsonl")
 
     model_names = [f.split('/')[3] for f in files]
     # model_names = sorted(model_names, key=lambda x: float(x.split('-')[1][:-1]))
     model_names = sorted(model_names, key=lambda x: '-'.join(x.split('-')[1:-1]))[::-1]
-    model_names = [m.replace('Qwen3-', '').replace('instruction_type=', '') for m in model_names]
+    model_names = [m.replace(f'{model}-', '').replace('instruction_type=', '') for m in model_names]
     print('model names =', model_names)
-    df = pd.DataFrame(columns=model_names)
+    avg_df = pd.DataFrame(columns=model_names)
+    pass_df = pd.DataFrame(columns=model_names)
+
     for file in files:
         data = read_jsonl(file)
+        if len(data) != 30:
+            continue
         model_name = file.split("/")[3]
-        model_name = model_name.replace('Qwen3-', '').replace('instruction_type=', '')
+        model_name = model_name.replace(f'{model}-', '').replace('instruction_type=', '')
 
         for i, item in enumerate(data):
             assert item['avg@k'] is not None, item['avg@k']
-            df.loc[i, model_name] = item['avg@k']
+            avg_df.loc[i, model_name] = item['avg@k']
+            pass_df.loc[i, model_name] = item['pass@k']
 
-    df.loc['avg'] = df.mean()
-    df.to_excel(f'{output_dir}/avg@k.xlsm', sheet_name='avg@k', index=False, engine='openpyxl')
-    print(df)
+    avg_df.loc['avg'] = avg_df.mean()
+    pass_df.loc['pass'] = pass_df.mean()
+    with pd.ExcelWriter(f'{output_dir}/{model}-results.xlsm', engine='openpyxl') as writer:
+        avg_df.to_excel(writer, sheet_name='avg@k', index=False)
+        pass_df.to_excel(writer, sheet_name='pass@k', index=False)
+    print('avg@k', avg_df, sep='\n')
+    print('pass@k', pass_df, sep='\n')

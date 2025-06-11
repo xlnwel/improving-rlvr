@@ -50,6 +50,8 @@ if __name__ == "__main__":
             example.pop('ID')
 
             data = {
+                "level": "Level 5", 
+                "type": "Math", 
                 "data_source": 'aime2024', 
                 "prompt": [{"role": "user", "content": prompt}], 
                 "ability": "math", 

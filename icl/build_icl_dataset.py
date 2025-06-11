@@ -19,9 +19,6 @@ from transformers import AutoTokenizer
 from transformers import set_seed as hf_set_seed
 from vllm import LLM, SamplingParams
 
-SYSTEM_PROMPT = "I am going to give you a series of demonstrations of math Problems and Solutions. When you respond, respond only with the Solution of the final Problem, think step by step and output the final answer within \\boxed{}. "
-COT_PROMPT = "Let's think step by step and output the final answer within \\boxed{}. "
-
 
 def set_seed(seed: int = 42) -> None:
     random.seed(seed)
@@ -472,7 +469,7 @@ def eval_model(args, aime24_dataset, math_dataset):
 
     # tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     st_model = "all-mpnet-base-v2"
-    similarity_path = os.path.join('icl/results', f'{st_model}_similarity.npy')
+    similarity_path = os.path.join('icl/results', f'{st_model}_hard_similarity.npy')
     if os.path.exists(similarity_path):
         similarities = np.load(similarity_path)
     else:
@@ -480,7 +477,8 @@ def eval_model(args, aime24_dataset, math_dataset):
         st = SentenceTransformer(model)
         aime24_probs = list(aime24_dataset['Problem'])
         aime24_embed = st.encode(aime24_probs)
-        math_probs = list(math_dataset['problem'])
+        hard_math_dataset = math_dataset.filter(lambda x: x['level'] == 'Level 5')
+        math_probs = list(hard_math_dataset['problem'])
         math_embed = st.encode(math_probs)
         similarities = st.similarity(aime24_embed, math_embed).numpy()
         np.save(similarity_path, similarities, allow_pickle=True, fix_imports=True)

@@ -11,7 +11,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import torch
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 from scipy.special import comb
 from sentence_transformers import SentenceTransformer, util
 from tqdm import tqdm
@@ -44,14 +44,8 @@ def compute_pass_at_k(n: int, c: int, k: int) -> float:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="vLLM Evaluation Script for 72B Model")
-
-    parser.add_argument("--data_dir", type=str, default="/oss/public/user/liuts/datasets/math/AIME_2024")
-    parser.add_argument("--data_name", type=str, default="AIME24")
-    parser.add_argument("--output_dir", "-o", type=str, default=None)
     parser.add_argument("--demonstrations", "-d", type=int, default=5)
-
     parser.add_argument("--seed", type=int, default=42)
-
     parser.add_argument("--n", type=int, default=8)
     parser.add_argument("--k", type=int, default=8)
     return parser.parse_args()
@@ -462,75 +456,64 @@ def clean_gpu_memory():
         torch.cuda.synchronize()
 
 
-def eval_model(args, aime24_dataset, math_dataset):
+def eval_model(args, test_dataset, math_dataset, name):
     k = args.k
     n = max(args.n, k)
     n_demos = args.demonstrations
 
     # tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     st_model = "all-mpnet-base-v2"
-    similarity_path = os.path.join('icl/results', f'{st_model}_hard_similarity.npy')
+    similarity_path = os.path.join('icl/results', f'{st_model}_{name}.npy')
     if os.path.exists(similarity_path):
         similarities = np.load(similarity_path)
     else:
         model = f'sentence-transformers/{st_model}'
         st = SentenceTransformer(model)
-        aime24_probs = list(aime24_dataset['Problem'])
-        aime24_embed = st.encode(aime24_probs)
+        test_probs = list(test_dataset['Problem'] if 'Problem' in test_dataset else test_dataset['problem'])
+        test_embed = st.encode(test_probs)
         hard_math_dataset = math_dataset.filter(lambda x: x['level'] == 'Level 5')
         math_probs = list(hard_math_dataset['problem'])
         math_embed = st.encode(math_probs)
-        similarities = st.similarity(aime24_embed, math_embed).numpy()
+        similarities = st.similarity(test_embed, math_embed).numpy()
         np.save(similarity_path, similarities, allow_pickle=True, fix_imports=True)
         del st
         clean_gpu_memory()
 
     data = []
-    for i in tqdm(range(0, len(aime24_dataset))):
-        problem, solution, answer = None, None, None
-        for name in ['Problem', 'problem']:
-            if name in aime24_dataset.features:
-                problem = aime24_dataset[name][i]
-                break
-        for name in ['Solution', 'solution']:
-            if name in aime24_dataset.features:
-                solution = aime24_dataset[name][i]
-                break
-        for name in ['Answer', 'answer']:
-            if name in aime24_dataset.features:
-                answer = aime24_dataset[name][i]
-                break
-        
+    for i in tqdm(range(0, len(test_dataset))):
         # demos = random.choices(math_dataset, k=args.demonstrations)
         scores = similarities[i]
         top_indices = np.argsort(-scores)[:n_demos]
         demos = [math_dataset[int(idx)] for idx in top_indices]
-        new_row = {
-            'problem': problem, 
-            'solution': solution, 
-            'answer': answer, 
-        }
+        new_row = {k.lower(): v for k, v in test_dataset[i].items()}
         for di, d in enumerate(demos):
             new_row.update({f'demo{di}_{k}': v for k, v in d.items()})
+            new_row[f'demo{di}_sim'] = scores[top_indices[di]]
         data.append(new_row)
     df = pd.DataFrame(data)
-    df.to_csv(f'icl/results/icl_aime2024.csv', index=False)
-    print(f'{len(df)=}')
-    print(df.columns)
+    print(df)
+    return df
 
 
 def main():
     args = parse_args()
     set_seed(args.seed)
     
-    aime24_dataset = prepare_data(args.data_dir)
-    print('AIME Dataset size: ', len(aime24_dataset))
-    math_dataset = prepare_data('/oss/public/user/liuts/datasets/math/MATH/competition_math/data/MATH/train')
-    answers = [extract_answer(s) for s in math_dataset['solution']]
-    math_dataset = math_dataset.add_column('answer', answers)
-    print('MATH Dataset size: ', len(aime24_dataset))
+    # test_dataset = prepare_data("/oss/public/user/liuts/datasets/math/MATH-500")
+    test_dataset = load_dataset('/oss/public/user/liuts/datasets/math/MATH-500', 'default')['test']
+    print('Test Dataset size: ', len(test_dataset))
+    train_dataset = prepare_data('/oss/public/user/liuts/datasets/math/MATH/competition_math/data/MATH/train')
+    # train_dataset = prepare_data('icl/results/Qwen3-8B-MATH-ppl-top2000.parquet')
+    # math_file = 'icl/results/Qwen3-8B-MATH-ppl-top2000.parquet'
+    # math_df = pd.read_parquet(math_file)
+    # train_dataset = Dataset.from_pandas(math_df)
+    answers = [extract_answer(s) for s in train_dataset['solution']]
+    train_dataset = train_dataset.add_column('answer', answers)
+    print('Train Dataset size: ', len(train_dataset))
+    name = 'math_similarity'
 
-    eval_model(args, aime24_dataset, math_dataset)
+    df = eval_model(args, test_dataset, train_dataset, name)
+    df.to_parquet(f'icl/results/icl-math.parquet', index=False)
 
 
 if __name__ == "__main__":

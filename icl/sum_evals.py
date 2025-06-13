@@ -38,6 +38,7 @@ def parse_args():
     parser.add_argument("--output_dir", "-o", type=str, default="icl/results/n=8-k=8")
     return parser.parse_args()
 
+
 if __name__ == '__main__':
     args = parse_args()
     model = args.model
@@ -64,8 +65,8 @@ if __name__ == '__main__':
             avg_df.loc[i, model_name] = item['avg@k']
             pass_df.loc[i, model_name] = item['pass@k']
 
-    avg_df.loc['avg'] = avg_df.mean()
-    pass_df.loc['pass'] = pass_df.mean()
+    avg_df.loc['avg@k'] = avg_df.mean()
+    pass_df.loc['pass@k'] = pass_df.mean()
     with pd.ExcelWriter(f'{output_dir}/{model}-results.xlsm', engine='openpyxl') as writer:
         avg_df.to_excel(writer, sheet_name='avg@k', index=False)
         pass_df.to_excel(writer, sheet_name='pass@k', index=False)

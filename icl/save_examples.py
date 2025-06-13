@@ -5,7 +5,7 @@ import os
 
 import pandas as pd
 
-from icl.eval_qwen3_icl2 import extract_answer
+from icl.eval_qwen3_icl import extract_answer
 
 
 def read_jsonl(path):
@@ -23,10 +23,11 @@ def parse_args():
     parser.add_argument("--output_dir", "-o", type=str, default="icl/results/n=8-k=8")
     return parser.parse_args()
 
+
 if __name__ == '__main__':
     args = parse_args()
     output_dir = args.output_dir
-    files = glob.glob(f"{output_dir}/Qwen3*/*jsonl")
+    files = glob.glob(f"{output_dir}/Qwen3-8B*/*jsonl")
 
     model_names = [f.split('/')[3] for f in files]
     # model_names = sorted(model_names, key=lambda x: float(x.split('-')[1][:-1]))

@@ -44,7 +44,7 @@ def compute_pass_at_k(n: int, c: int, k: int) -> float:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="vLLM Evaluation Script for 72B Model")
-    parser.add_argument("--demonstrations", "-d", type=int, default=5)
+    parser.add_argument("--demonstrations", "-d", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n", type=int, default=8)
     parser.add_argument("--k", type=int, default=8)
@@ -456,7 +456,7 @@ def clean_gpu_memory():
         torch.cuda.synchronize()
 
 
-def eval_model(args, test_dataset, math_dataset, name):
+def eval_model(args, test_dataset, train_dataset, name):
     k = args.k
     n = max(args.n, k)
     n_demos = args.demonstrations
@@ -471,8 +471,8 @@ def eval_model(args, test_dataset, math_dataset, name):
         st = SentenceTransformer(model)
         test_probs = list(test_dataset['Problem'] if 'Problem' in test_dataset else test_dataset['problem'])
         test_embed = st.encode(test_probs)
-        hard_math_dataset = math_dataset.filter(lambda x: x['level'] == 'Level 5')
-        math_probs = list(hard_math_dataset['problem'])
+        # hard_math_dataset = train_dataset.filter(lambda x: x['level'] == 'Level 5')
+        math_probs = list(train_dataset['problem'])
         math_embed = st.encode(math_probs)
         similarities = st.similarity(test_embed, math_embed).numpy()
         np.save(similarity_path, similarities, allow_pickle=True, fix_imports=True)
@@ -481,10 +481,10 @@ def eval_model(args, test_dataset, math_dataset, name):
 
     data = []
     for i in tqdm(range(0, len(test_dataset))):
-        # demos = random.choices(math_dataset, k=args.demonstrations)
+        # demos = random.choices(train_dataset, k=args.demonstrations)
         scores = similarities[i]
         top_indices = np.argsort(-scores)[:n_demos]
-        demos = [math_dataset[int(idx)] for idx in top_indices]
+        demos = [train_dataset[int(idx)] for idx in top_indices]
         new_row = {k.lower(): v for k, v in test_dataset[i].items()}
         for di, d in enumerate(demos):
             new_row.update({f'demo{di}_{k}': v for k, v in d.items()})

@@ -1,22 +1,23 @@
-import os
-import re
-import gc
-import time
-import json
-import random
-import glob
-import numpy as np
 import argparse
-import torch
-from scipy.special import comb
+import gc
+import glob
+import json
+import os
+import random
+import re
+import time
 from datetime import datetime
-from tqdm import tqdm
 
+import numpy as np
+import pandas as pd
 import torch
-from vllm import LLM, SamplingParams
-from transformers import AutoTokenizer, set_seed as hf_set_seed
 from datasets import load_dataset
+from scipy.special import comb
 from sentence_transformers import SentenceTransformer, util
+from tqdm import tqdm
+from transformers import AutoTokenizer
+from transformers import set_seed as hf_set_seed
+from vllm import LLM, SamplingParams
 
 SYSTEM_PROMPT = "I am going to give you a series of demonstrations of math Problems and Solutions. When you respond, respond only with the Solution of the final Problem, think step by step and output the final answer within \\boxed{}. "
 COT_PROMPT = "Let's think step by step and output the final answer within \\boxed{}. "
@@ -47,12 +48,9 @@ def compute_pass_at_k(n: int, c: int, k: int) -> float:
 def parse_args():
     parser = argparse.ArgumentParser(description="vLLM Evaluation Script for 72B Model")
 
-    parser.add_argument("--model_name", type=str, default="Qwen3-30B-A3B")
-    parser.add_argument("--data_dir", type=str, default="/oss/public/user/liuts/datasets/math/AIME_2024")
-    parser.add_argument("--data_name", type=str, default="AIME24")
-    parser.add_argument("--output_dir", "-o", type=str, default=None)
+    parser.add_argument("--instruction_type", "-i", type=str, default='user')
     parser.add_argument("--demonstrations", "-d", type=int, default=5)
-
+    parser.add_argument("--demo_type", "-dt", type=str, default='topk')
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--n", type=int, default=8)
@@ -465,34 +463,30 @@ def clean_gpu_memory():
         torch.cuda.synchronize()
 
 
-def eval_model(args, model_path, aime24_dataset, math_dataset, batch_size=100):
+def eval_model(args, model_path, dataset, batch_size=100):
     k = args.k
     n = max(args.n, k)
     model_name = model_path.split('/')[-1]
-    output_dir = f'results-n={n}-k={k}/{model_name}-{args.demonstrations}demos'
+    n_demos = args.demonstrations
+    output_dir = f'icl/results/n={n}-k={k}/{model_name}-instruction_type={args.instruction_type}-demo_type={args.demo_type}-{n_demos}hard_demos'
 
-    if os.path.isdir(f'{output_dir}'):
+    if os.path.isdir(output_dir):
         pass
+        # if os.path.exists(f'{output_dir}/all_results.jsonl'):
+        #     return
     else:
         os.makedirs(output_dir)
-    # tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    st = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
-    aime24_probs = list(aime24_dataset['Problem'])
-    aime24_embed = st.encode(aime24_probs)
-    math_probs = list(math_dataset['problem'])
-    math_embed = st.encode(math_probs)
-    similarities = st.similarity(aime24_embed, math_embed)
-
-    del st
-    clean_gpu_memory()
 
     llm = LLM(
         model=model_path,
         tensor_parallel_size=8,
         trust_remote_code=True,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=0.6,
+        max_model_len=32768, 
         dtype="bfloat16",
     )
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
     sampling_params = SamplingParams(
         temperature=0.7,
         top_p=0.95,
@@ -501,42 +495,61 @@ def eval_model(args, model_path, aime24_dataset, math_dataset, batch_size=100):
         seed=args.seed, 
         n=n
     )
-    for i in tqdm(range(0, len(aime24_dataset), batch_size)):
-        start = i
-        end = min(i + batch_size, len(aime24_dataset))
 
-        problems, solutions, answers = None, None, None
-        for name in ['Problem', 'problem']:
-            if name in aime24_dataset.features:
-                problems = aime24_dataset[name][start:end]
-                break
-        for name in ['Solution', 'solution']:
-            if name in aime24_dataset.features:
-                solutions = aime24_dataset[name][start:end]
-                break
-        for name in ['Answer', 'answer']:
-            if name in aime24_dataset.features:
-                answers = aime24_dataset[name][start:end]
-                break
+    similarity_path = 'icl/results/all-mpnet-base-v2_math_similarity.npy'
+    similarities = np.load(similarity_path)
+    for i in tqdm(range(0, len(dataset), batch_size)):
+        start = i
+        end = min(i + batch_size, len(dataset))
+
+        problems = dataset['problem'][start:end]
+        solutions = dataset['solution'][start:end]
+        answers = dataset['answer'][start:end]
         
+        n_dataset_demos = (len(dataset.columns) - 3) // 5
         prompts = []
-        for j, p in enumerate(problems):
-            # demos = random.choices(math_dataset, k=args.demonstrations)
-            scores = similarities[i*batch_size+j]
-            top_indices = np.argsort(-scores)[:args.demonstrations]
-            demos = [math_dataset[int(idx)] for idx in top_indices]
+        for j, (p, s, a) in enumerate(zip(problems, solutions, answers)):
+            row_idx = i*batch_size + j
+            row = dataset.iloc[row_idx]
+            weights = np.exp(np.sort(similarities[row_idx])[-n_dataset_demos:])[::-1]
+            if args.demo_type == 'sample':
+                demo_indices = random.choices(range(n_dataset_demos), weights=weights, k=n_demos)
+            elif args.demo_type == 'topk':
+                demo_indices = list(range(n_dataset_demos))[:n_demos]
+            else:
+                raise ValueError(f'Invalid demo type: {args.demo_type}')
+            demos = [
+                {k.replace(f'demo{demo_idx}_', ''): v for k, v in row.items() if k.startswith(f'demo{demo_idx}_')} 
+                for demo_idx in demo_indices
+            ]
+            demos = sorted(demos, key=lambda x: x['level'])
+            assert len(demos) == len(demo_indices) == n_demos, (len(demos), len(demo_indices), n_demos)
 
             m = []
-            content = '\n'.join([f"Problem: {d['problem']}\nAnswer: {SYSTEM_PROMPT}\n{d['solution']}" for d in demos])
-            content = '\n'.join([content, f"Problem: {p}\nAnswer: {SYSTEM_PROMPT}\n"])
-            # for d in demos:
-            #     m.append({"role": "user", "content": f'Problem: {d["problem"]}'})
-            #     m.append({"role": "assistant", "content": f"<think>\n\n</think>Solution: \n{d['solution']}"})
-            # m.append({"role": "user", "content": f'Problem: {p}'})
+            content = '\n\n---\n'.join([f"Problem: {d['problem']}\nSolution: {COT_PROMPT}\n{d['solution']}" for d in demos])
+            content = '\n\n---\n'.join([content, f"Problem: {p}\nSolution: {COT_PROMPT}\n"])
             prompts.append(content)
-        # prompts = tokenizer.apply_chat_template(
-        #     messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-        # )
+
+        if args.instruction_type == 'system':
+            messages = [
+                [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+                for prompt in prompts
+            ]
+            prompts = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+        elif args.instruction_type == 'user':
+            messages = [
+                [{"role": "user", "content": '\n'.join([SYSTEM_PROMPT, prompt])}]
+                for prompt in prompts
+            ]
+            prompts = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+        elif args.instruction_type == 'custom':
+            prompts = ['\n'.join([SYSTEM_PROMPT, prompt]) for prompt in prompts]
+        else:
+            raise ValueError(f'Instruction type {args.instruction_type} not supported')
 
         outputs = llm.generate(prompts, sampling_params)
         outputs = sorted(outputs, key=lambda x: int(x.request_id))
@@ -553,7 +566,7 @@ def eval_model(args, model_path, aime24_dataset, math_dataset, batch_size=100):
                     c += 1
 
             result = {
-                "prompt": prompt
+                "prompt": prompt,
                 "problem": prob,
                 "solution": solu,
                 "answer": ans,
@@ -563,23 +576,6 @@ def eval_model(args, model_path, aime24_dataset, math_dataset, batch_size=100):
                 "pass@k": compute_pass_at_k(n, c, k),
             }
             results.append(result)
-
-            out_file = f"{output_dir}/{start+j}-avg@{k}={result['avg@k']}-pass@{k}={result['pass@k']}.md"
-            with open(out_file, 'w', encoding='utf-8') as f:
-                for key in ['prompt', 'solution', 'answer']:
-                    print(f"{key}: {result[key]}", sep='\n', file=f)
-                    print('-'*100, file=f)
-                
-                for i, (r, p) in enumerate(zip(result['responses'], result['predictions'])):
-                    print(f'---{i}-th Entry---')
-                    print(f"Response: {r}", sep='\n', file=f)
-                    print('-'*100, file=f)
-                    print(f"Prediction: {p}", sep='\n', file=f)
-                    print('-'*100, file=f)
-                
-                print(f"Avg@{k}: {result['avg@k']}", file=f)
-                print('-'*100, file=f)
-                print(f"Pass@{k}: {result['pass@k']}", file=f)
 
         out_file = f'{output_dir}/all_results.jsonl'
         save_res_jsonl(results, out_file)
@@ -593,23 +589,17 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     
-    aime24_dataset = prepare_data(args.data_dir)
+    aime24_dataset = pd.read_parquet('icl/results/icl-math.parquet')
     print('AIME Dataset size: ', len(aime24_dataset))
-    math_dataset = prepare_data('/oss/public/user/liuts/datasets/math/MATH/competition_math/data/MATH/train')
-    answers = [extract_answer(s) for s in math_dataset['solution']]
-    math_dataset = math_dataset.add_column('answer', answers)
-    print('MATH Dataset size: ', len(aime24_dataset))
-
-    chat_prompts = []
-    meta_infos = []
 
     batch_size = 100
-    k = args.k
-    n = max(args.n, k)
-    model_paths = glob.glob(f'/oss/public/user/liuts/model/Qwen3*', recursive=False)
+    model_paths = glob.glob(f'/oss/public/user/liuts/model/Qwen3-8B*', recursive=False)
     model_paths = [model_path for model_path in model_paths if '1.7B' not in model_path and '4B' not in model_path]
+    model_paths = [model_path for model_path in model_paths if model_path.endswith('8B')]
+    print('Model paths:', model_paths)
+
     for model_path in model_paths:
-        eval_model(args, model_path, aime24_dataset, math_dataset, batch_size)
+        eval_model(args, model_path, aime24_dataset, batch_size)
 
 
 if __name__ == "__main__":

@@ -28,26 +28,98 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, kl_penalty
 from verl.utils.debug import GPUMemoryLogger
-from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
+from verl.utils.device import (get_device_name, get_torch_device,
+                               is_cuda_available, is_npu_available)
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
+from verl.utils.seqlen_balancing import (get_reverse_idx,
+                                         rearrange_micro_batches)
 from verl.utils.torch_functional import logprobs_from_logits
-from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
+from verl.utils.ulysses import (gather_outpus_and_unpad, ulysses_pad,
+                                ulysses_pad_and_slice_inputs)
 from verl.workers.actor import BasePPOActor
 
 if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    from flash_attn.bert_padding import (index_first_axis, pad_input,
+                                         rearrange, unpad_input)
 elif is_npu_available:
-    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
+    from transformers.integrations.npu_flash_attention import (
+        index_first_axis, pad_input, rearrange, unpad_input)
 
 
 __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def compute_policy_loss_experimental(
+    old_log_prob,
+    log_prob,
+    advantages,
+    response_mask,
+    cliprange=None,
+    cliprange_low=None,
+    cliprange_high=None,
+    clip_ratio_c=3.0,
+    loss_agg_mode: str = "token-mean",
+    low_threshold=None,
+):
+    """
+    Compute the clipped policy objective and related metrics for PPO.
+
+    Adapted from
+    https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        cliprange (float, optional):
+            Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+            Defaults to None (must be provided).
+        cliprange_low (float, optional):
+            Lower clip range for dual-clip PPO. Defaults to same as `cliprange`.
+        cliprange_high (float, optional):
+            Upper clip range for dual-clip PPO. Defaults to same as `cliprange`.
+        clip_ratio_c (float, optional):
+            Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
+            Defaults to 3.0.
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+    """
+    assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
+
+    negative_approx_kl = log_prob - old_log_prob
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    pg_losses1 = -advantages * ratio
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    if low_threshold is not None:
+        clip_pg_losses1 = torch.where(torch.exp(log_prob) < low_threshold, pg_losses1, clip_pg_losses1)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -146,14 +218,15 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
 
+                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                logits_rmpad.div_(temperature)
+                logits = logits_rmpad
+                labels = input_ids_rmpad_rolled
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
 
                 else:
-                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
-                    logits_rmpad.div_(temperature)
-
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
@@ -199,10 +272,25 @@ class DataParallelPPOActor(BasePPOActor):
                     seqlen=seqlen,
                 )
 
+                logits = pad_input(
+                    hidden_states=logits,
+                    indices=indices,
+                    batch=batch_size,
+                    seqlen=seqlen,
+                )
+                labels = pad_input(
+                    hidden_states=labels.unsqueeze(-1),
+                    indices=indices,
+                    batch=batch_size,
+                    seqlen=seqlen,
+                )
+
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                logits = logits[:, -response_length - 1 : -1, :]
+                labels  = labels.squeeze(-1)[:, -response_length - 1 : -1]
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
@@ -217,20 +305,20 @@ class DataParallelPPOActor(BasePPOActor):
                     **extra_args,
                 )  # prevent model thinks we are generating
 
+                logits = output.logits
+                logits.div_(temperature)
+                logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                labels = None
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
                 else:
-                    logits = output.logits
-
-                    logits.div_(temperature)
-                    logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
-            return entropy, log_probs
+            return entropy, log_probs, logits, labels
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -293,26 +381,32 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        logits_lst = []
+        labels_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
+                entropy, log_probs, logits, labels = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            logits_lst.append(logits)
+            labels_lst.append(labels)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
+        logits = torch.concat(logits_lst, dim=0)
+        labels = torch.concat(labels_lst, dim=0)
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
 
-        return log_probs, entropys
+        return log_probs, entropys, logits, labels
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -322,7 +416,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages", 'old_entropy', 'old_logits']
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -386,9 +480,9 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
+                    entropy, log_prob, logits, labels = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
 
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_experimental(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
@@ -398,6 +492,7 @@ class DataParallelPPOActor(BasePPOActor):
                         cliprange_high=clip_ratio_high,
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
+                        low_threshold=self.config.low_threshold
                     )
 
                     if entropy_coeff != 0:
@@ -437,4 +532,46 @@ class DataParallelPPOActor(BasePPOActor):
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
+
+        for batch_idx, data in enumerate(dataloader):
+            old_log_prob = data["old_log_probs"]
+            old_logits = data["old_logits"]
+            old_entropy = data["old_entropy"]
+            old_prob = torch.exp(old_log_prob)
+            with torch.no_grad():
+                entropy, log_prob, logits, labels = self._forward_micro_batch(
+                    micro_batch=data, temperature=temperature, calculate_entropy=True)
+                prob = torch.exp(log_prob)
+                ratios = prob / old_prob
+            batch_metrics = {}
+            range_masks = {
+                '0_0.001': (old_prob >= 0) & (old_prob < 0.001),
+                '0.001_0.01': (old_prob >= 0.001) & (old_prob < 0.01),
+                '0.01_0.1': (old_prob >= 0.01) & (old_prob < 0.1),
+                '0.1_1': (old_prob >= 0.1) & (old_prob <= 1)
+            }
+
+            old_log_probs = old_logits - torch.logsumexp(old_logits, dim=-1, keepdim=True)
+            log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+            forward_kl = torch.sum(torch.exp(log_probs) * (log_probs - old_log_probs), dim=-1)
+            backward_kl = torch.sum(torch.exp(old_log_probs) * (old_log_probs - log_probs), dim=-1)
+            for name, mask in range_masks.items():
+                ratios = verl_F.masked_mean(ratios, mask)
+                prob_diff = verl_F.masked_mean(torch.exp(prob - old_prob), mask)
+                entropy_diff = verl_F.masked_mean(entropy-old_entropy, mask)
+                old_entropy = verl_F.masked_mean(old_entropy, mask)
+                entropy = verl_F.masked_mean(entropy, mask)
+                forward_kl = verl_F.masked_mean(forward_kl, mask)
+                backward_kl = verl_F.masked_mean(backward_kl, mask)
+
+                batch_metrics[f'actor/ratio-{name}'] = ratios.detach().item()
+                batch_metrics[f'actor/prob_diff-{name}'] = prob_diff.detach().item()
+                batch_metrics[f'actor/old_entropy-{name}'] = old_entropy.detach().item()
+                batch_metrics[f'actor/entropy-{name}'] = entropy.detach().item()
+                batch_metrics[f'actor/entropy_diff-{name}'] = entropy_diff.detach().item()
+                batch_metrics[f'actor/forward_kl-{name}'] = forward_kl.detach().item()
+                batch_metrics[f'actor/backward_kl-{name}'] = backward_kl.detach().item()
+
+            append_to_dict(metrics, batch_metrics)
+
         return metrics

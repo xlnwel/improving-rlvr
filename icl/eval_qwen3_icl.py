@@ -68,11 +68,13 @@ def prepare_data(data_dir):
 
 def save_res_jsonl(samples, save_path):
     folder = os.path.dirname(save_path)
-    os.makedirs(folder, exist_ok=True)
+    if not os.path.isdir(folder):
+        os.makedirs(folder, exist_ok=True)
 
     with open(save_path, "a", encoding="utf-8") as f:
         for sample in samples:
             f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+
     print("Saved to", save_path)
 
 
@@ -471,11 +473,8 @@ def eval_model(args, model_path, dataset, batch_size=100):
     output_dir = f'icl/results/n={n}-k={k}/{model_name}-instruction_type={args.instruction_type}-demo_type={args.demo_type}-{n_demos}hard_demos'
 
     if os.path.isdir(output_dir):
-        pass
-        # if os.path.exists(f'{output_dir}/all_results.jsonl'):
-        #     return
-    else:
-        os.makedirs(output_dir)
+        if os.path.exists(f'{output_dir}/all_results.jsonl'):
+            return
 
     llm = LLM(
         model=model_path,
@@ -509,7 +508,7 @@ def eval_model(args, model_path, dataset, batch_size=100):
         n_dataset_demos = (len(dataset.columns) - 3) // 5
         prompts = []
         for j, (p, s, a) in enumerate(zip(problems, solutions, answers)):
-            row_idx = i*batch_size + j
+            row_idx = i + j
             row = dataset.iloc[row_idx]
             weights = np.exp(np.sort(similarities[row_idx])[-n_dataset_demos:])[::-1]
             if args.demo_type == 'sample':
@@ -540,14 +539,14 @@ def eval_model(args, model_path, dataset, batch_size=100):
             )
         elif args.instruction_type == 'user':
             messages = [
-                [{"role": "user", "content": '\n'.join([SYSTEM_PROMPT, prompt])}]
+                [{"role": "user", "content": '\n\n'.join([SYSTEM_PROMPT, prompt])}]
                 for prompt in prompts
             ]
             prompts = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
             )
         elif args.instruction_type == 'custom':
-            prompts = ['\n'.join([SYSTEM_PROMPT, prompt]) for prompt in prompts]
+            prompts = ['\n\n'.join([SYSTEM_PROMPT, prompt]) for prompt in prompts]
         else:
             raise ValueError(f'Instruction type {args.instruction_type} not supported')
 
@@ -559,11 +558,20 @@ def eval_model(args, model_path, dataset, batch_size=100):
         for j, (output_texts, prompt, prob, solu, ans) in enumerate(zip(outputs_texts, prompts, problems, solutions, answers)):
             predictions = []
             c = 0
+            right_response = None
+            right_prediction = None
+            wrong_response = None
+            wrong_prediction = None
             for output_text in output_texts:
                 pred_ans = extract_answer(output_text)
                 predictions.append(pred_ans)
                 if str(ans) == pred_ans:
                     c += 1
+                    right_response = output_text
+                    right_prediction = pred_ans
+                else:
+                    wrong_response = output_text
+                    wrong_prediction = pred_ans
 
             result = {
                 "prompt": prompt,
@@ -577,9 +585,29 @@ def eval_model(args, model_path, dataset, batch_size=100):
             }
             results.append(result)
 
+        if not os.path.isdir(output_dir):
+            os.makedirs(output_dir)
         out_file = f'{output_dir}/all_results.jsonl'
         save_res_jsonl(results, out_file)
         print(f"Saved {end} results to {out_file}")
+        sep = '\n\n' + '='*100 + '\n\n'
+        print(
+            f'Prompt: {prompt}',
+            f'Solution: {solu}', 
+            f'Answer: {ans}',
+            sep=sep
+        )
+        if right_response is not None:
+            print(sep)
+            print(f"Right Response: {right_response}")
+            print(f'Right Prediction: {right_prediction}')
+        if wrong_response is not None:
+            print(sep)
+            print(f"Wrong Response: {wrong_response}")
+            print(f'Wrong Prediction: {wrong_prediction}')
+        print(sep)
+        print(f'Avg@k: {result["avg@k"]}', f'Pass@{k}: {result["pass@k"]}', sep=sep)
+
     
     print("Evaluation finished. Results saved to:", out_file)
     del llm
@@ -589,8 +617,8 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     
-    aime24_dataset = pd.read_parquet('icl/results/icl-math.parquet')
-    print('AIME Dataset size: ', len(aime24_dataset))
+    dataset = pd.read_parquet('icl/results/icl-math.parquet')
+    print('AIME Dataset size: ', len(dataset))
 
     batch_size = 100
     model_paths = glob.glob(f'/oss/public/user/liuts/model/Qwen3-8B*', recursive=False)
@@ -599,7 +627,7 @@ def main():
     print('Model paths:', model_paths)
 
     for model_path in model_paths:
-        eval_model(args, model_path, aime24_dataset, batch_size)
+        eval_model(args, model_path, dataset, batch_size)
 
 
 if __name__ == "__main__":

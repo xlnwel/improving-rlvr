@@ -28,22 +28,30 @@ def main(config):
 
 
 def run_ppo(config) -> None:
-    if not ray.is_initialized():
+    # if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(
-            runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN", "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true"}},
-            num_cpus=config.ray_init.num_cpus,
-        )
+    ray.init(
+        runtime_env={"env_vars": {
+            "TOKENIZERS_PARALLELISM": "true", 
+            "NCCL_DEBUG": "WARN", 
+            "VLLM_LOGGING_LEVEL": "WARN", 
+            "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+            "RAY_DEBUG_POST_MORTEM": "1"
+        }},
+        num_cpus=config.ray_init.num_cpus,
+    )
 
-    runner = TaskRunner.remote()
-    ray.get(runner.run.remote(config))
+    # runner = TaskRunner.remote()
+    # ray.get(runner.run.remote(config))
+    runner = TaskRunner()
+    runner.run(config)
     # create a timeline trace file to analyze the performance
     timeline_json_file = config.ray_init.get("timeline_json_file", None)
     if timeline_json_file:
         ray.timeline(filename=timeline_json_file)
 
 
-@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
+# @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 class TaskRunner:
     def run(self, config):
         # print initial config

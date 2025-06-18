@@ -122,6 +122,66 @@ def compute_policy_loss_experimental(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+def reconstruct_last_k_optimized(
+    x: torch.Tensor, 
+    indices: torch.Tensor, 
+    batch_size: int, 
+    seqlen: int, 
+    response_length: int,
+) -> torch.Tensor:
+    """
+    高效重建原始张量A的倒数K个位置（A[:, -response_length:, :]）
+    显存占用从O(x*S*D)降至O(x*response_length*D + M)，特别适合大D场景
+
+    参数:
+        x: 解压后的张量 [M, D]
+        indices: 解压索引 [M]
+        batch_size: 原始batch大小
+        seqlen: 原始序列长度
+        response_length: 要获取的倒数位置数
+
+    返回:
+        重建的张量 [x, response_length, D]
+    """
+    dtype = x.dtype
+    device = x.device
+    
+    # 1. 计算目标位置的全局索引 [x, response_length]
+    global_indices = (
+        torch.arange(batch_size, device=device)[:, None] * seqlen + 
+        (seqlen - 1 - torch.arange(response_length - 1, -1, -1, device=device))
+    ).reshape(-1)  # 展平为 [x*response_length]
+    
+    # 2. 创建全零结果模板 [x*response_length, D]
+    result = torch.zeros(batch_size * response_length, x.shape[1], 
+                         dtype=dtype, device=device)
+    
+    # 无有效索引时直接返回
+    if indices.numel() == 0:
+        return result.view(batch_size, response_length, -1)
+    
+    # 3. 索引匹配（二分查找替代全量扫描）
+    sorted_indices, sort_idx = torch.sort(indices)
+    indices_len = indices.size(0)
+    
+    # 使用searchsorted找到每个全局索引在sorted_indices中的位置
+    positions = torch.searchsorted(sorted_indices, global_indices)
+    
+    # 修复：确保positions索引不超过indices长度
+    positions = torch.minimum(positions, torch.tensor(indices_len - 1, device=device))
+    
+    # 创建有效掩码（两步验证确保安全）
+    valid_mask = (positions < indices_len) & (sorted_indices[positions] == global_indices)
+    
+    # 5. 选择性复制数据（仅处理有效位置）
+    if valid_mask.any():
+        # 获取原始B中的行索引
+        orig_idx = sort_idx[positions[valid_mask]]
+        result[valid_mask] = x[orig_idx]
+    
+    return result.view(batch_size, response_length, -1)
+
+
 class DataParallelPPOActor(BasePPOActor):
     def __init__(self, config, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
         """When optimizer is None, it is Reference Policy"""
@@ -146,7 +206,7 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
-    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, return_logits=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             entropy: # (bs, response_len)
@@ -272,25 +332,20 @@ class DataParallelPPOActor(BasePPOActor):
                     seqlen=seqlen,
                 )
 
-                logits = pad_input(
-                    hidden_states=logits,
-                    indices=indices,
-                    batch=batch_size,
-                    seqlen=seqlen,
-                )
-                labels = pad_input(
-                    hidden_states=labels.unsqueeze(-1),
-                    indices=indices,
-                    batch=batch_size,
-                    seqlen=seqlen,
-                )
+                if return_logits:
+                    logits = reconstruct_last_k_optimized(
+                        logits, indices, batch_size, seqlen, response_length+1
+                    )
+                    labels = reconstruct_last_k_optimized(
+                        labels.unsqueeze(-1), indices, batch_size, seqlen, response_length+1
+                    )
+                    logits = logits[:, -response_length - 1 : -1, :]
+                    labels  = labels.squeeze(-1)[:, -response_length - 1 : -1]
 
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
-                logits = logits[:, -response_length - 1 : -1, :]
-                labels  = labels.squeeze(-1)[:, -response_length - 1 : -1]
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
@@ -318,7 +373,10 @@ class DataParallelPPOActor(BasePPOActor):
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
-            return entropy, log_probs, logits, labels
+            if return_logits:
+                return entropy, log_probs, logits, labels
+            else:
+                return entropy, log_probs
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -381,32 +439,27 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
-        logits_lst = []
-        labels_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs, logits, labels = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
+                entropy, log_probs, *_ = self._forward_micro_batch(
+                    micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
-            logits_lst.append(logits)
-            labels_lst.append(labels)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
-        logits = torch.concat(logits_lst, dim=0)
-        labels = torch.concat(labels_lst, dim=0)
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
 
-        return log_probs, entropys, logits, labels
+        return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -416,7 +469,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages", 'old_entropy', 'old_logits']
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -434,6 +487,39 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        old_logits_list = []
+        old_entropy_list = []
+        with torch.no_grad():
+            for batch_idx, data in enumerate(dataloader):
+                mini_batch = data
+                if has_multi_modal_inputs:
+                    num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+                    micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+                elif self.config.use_dynamic_bsz:
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                else:
+                    # split batch into micro_batches
+                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                entropy_list = []
+                logits_list = []
+                for data in micro_batches:
+                    # Support all hardwares
+                    if isinstance(data, DataProto):
+                        data = {**data.batch.to(get_torch_device().current_device()), **data.non_tensor_batch}
+                    else:
+                        data = data.to(get_torch_device().current_device())
+                    entropy, log_prob, logits, labels = self._forward_micro_batch(
+                        micro_batch=data, temperature=temperature, 
+                        calculate_entropy=True, return_logits=True)
+                    entropy_list.append(entropy)
+                    logits_list.append(logits)
+                    break
+                old_logits_list.append(logits_list)
+                old_entropy_list.append(entropy_list)
+                break
+
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
@@ -480,7 +566,9 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob, logits, labels = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
+                    entropy, log_prob = self._forward_micro_batch(
+                        micro_batch=data, temperature=temperature, 
+                        calculate_entropy=calculate_entropy)
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_experimental(
                         old_log_prob=old_log_prob,
@@ -533,45 +621,99 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
 
-        for batch_idx, data in enumerate(dataloader):
-            old_log_prob = data["old_log_probs"]
-            old_logits = data["old_logits"]
-            old_entropy = data["old_entropy"]
-            old_prob = torch.exp(old_log_prob)
-            with torch.no_grad():
-                entropy, log_prob, logits, labels = self._forward_micro_batch(
-                    micro_batch=data, temperature=temperature, calculate_entropy=True)
-                prob = torch.exp(log_prob)
-                ratios = prob / old_prob
-            batch_metrics = {}
-            range_masks = {
-                '0_0.001': (old_prob >= 0) & (old_prob < 0.001),
-                '0.001_0.01': (old_prob >= 0.001) & (old_prob < 0.01),
-                '0.01_0.1': (old_prob >= 0.01) & (old_prob < 0.1),
-                '0.1_1': (old_prob >= 0.1) & (old_prob <= 1)
-            }
+        with torch.no_grad():
+            for batch_idx, data in enumerate(dataloader):
+                mini_batch = data
+                if has_multi_modal_inputs:
+                    num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+                    micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+                elif self.config.use_dynamic_bsz:
+                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                else:
+                    # split batch into micro_batches
+                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
-            old_log_probs = old_logits - torch.logsumexp(old_logits, dim=-1, keepdim=True)
-            log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
-            forward_kl = torch.sum(torch.exp(log_probs) * (log_probs - old_log_probs), dim=-1)
-            backward_kl = torch.sum(torch.exp(old_log_probs) * (old_log_probs - log_probs), dim=-1)
-            for name, mask in range_masks.items():
-                ratios = verl_F.masked_mean(ratios, mask)
-                prob_diff = verl_F.masked_mean(torch.exp(prob - old_prob), mask)
-                entropy_diff = verl_F.masked_mean(entropy-old_entropy, mask)
-                old_entropy = verl_F.masked_mean(old_entropy, mask)
-                entropy = verl_F.masked_mean(entropy, mask)
-                forward_kl = verl_F.masked_mean(forward_kl, mask)
-                backward_kl = verl_F.masked_mean(backward_kl, mask)
+                for micro_idx, data in enumerate(micro_batches):
+                    # Support all hardwares
+                    if isinstance(data, DataProto):
+                        data = {**data.batch.to(get_torch_device().current_device()), **data.non_tensor_batch}
+                    else:
+                        data = data.to(get_torch_device().current_device())
+                    entropy, log_prob, logits, labels = self._forward_micro_batch(
+                        micro_batch=data, temperature=temperature, 
+                        calculate_entropy=True, return_logits=True)
+                    
+                    responses = data["responses"]
+                    response_length = responses.size(1)
+                    attention_mask = data["attention_mask"]
+                    if multi_turn:
+                        response_mask = data["loss_mask"][:, -response_length:]
+                    else:
+                        response_mask = attention_mask[:, -response_length:]
 
-                batch_metrics[f'actor/ratio-{name}'] = ratios.detach().item()
-                batch_metrics[f'actor/prob_diff-{name}'] = prob_diff.detach().item()
-                batch_metrics[f'actor/old_entropy-{name}'] = old_entropy.detach().item()
-                batch_metrics[f'actor/entropy-{name}'] = entropy.detach().item()
-                batch_metrics[f'actor/entropy_diff-{name}'] = entropy_diff.detach().item()
-                batch_metrics[f'actor/forward_kl-{name}'] = forward_kl.detach().item()
-                batch_metrics[f'actor/backward_kl-{name}'] = backward_kl.detach().item()
+                    old_log_prob = data["old_log_probs"]
+                    old_logits = old_logits_list[batch_idx][micro_idx]
+                    old_entropy = old_entropy_list[batch_idx][micro_idx]
+                    old_prob = torch.exp(old_log_prob)
+                    entropy, log_prob, logits, labels = self._forward_micro_batch(
+                        micro_batch=data, temperature=temperature, 
+                        calculate_entropy=True, return_logits=True)
+                    prob = torch.exp(log_prob)
+                    ratios = prob / old_prob
+                    batch_metrics = {}
+                    prob_masks = {
+                        '0_0.001': (old_prob >= 0) & (old_prob < 0.001) & response_mask,
+                        '0.001_0.01': (old_prob >= 0.001) & (old_prob < 0.01) & response_mask,
+                        '0.01_0.1': (old_prob >= 0.01) & (old_prob < 0.1) & response_mask,
+                        '0.1_0.25': (old_prob >= 0.1) & (old_prob < 0.25) & response_mask,
+                        '0.25_0.5': (old_prob >= 0.25) & (old_prob < 0.5) & response_mask,
+                        '0.5_0.75': (old_prob >= 0.5) & (old_prob < 0.75) & response_mask,
+                        '0.75_1': (old_prob >= 0.75) & (old_prob <= 1) & response_mask,
+                    }
+                    prob_masks = {f'prob-{k}': v for k, v in prob_masks.items()}
+                    ent_perc = {
+                        '0.2': torch.quantile(entropy, q=0.2),
+                        '0.4': torch.quantile(entropy, q=0.4),
+                        '0.6': torch.quantile(entropy, q=0.6),
+                        '0.8': torch.quantile(entropy, q=0.8),
+                        '1': torch.quantile(entropy, q=1),
+                    }
+                    ent_masks = {
+                        '0_0.2': (entropy <= ent_perc['0.2']) & response_mask,
+                        '0.2_0.4': (entropy > ent_perc['0.2']) & (entropy <= ent_perc['0.4']) & response_mask,
+                        '0.4_0.6': (entropy > ent_perc['0.4']) & (entropy <= ent_perc['0.6']) & response_mask,
+                        '0.6_0.8': (entropy > ent_perc['0.6']) & (entropy <= ent_perc['0.8']) & response_mask,
+                        '0.8_1': (entropy > ent_perc['0.8']) & (entropy <= ent_perc['1']) & response_mask,
+                    }
+                    ent_masks = {f'entropy-{k}': v for k, v in ent_masks.items()}
 
-            append_to_dict(metrics, batch_metrics)
+                    old_log_probs = old_logits - torch.logsumexp(old_logits, dim=-1, keepdim=True)
+                    log_probs = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+                    forward_kl = torch.sum(torch.exp(log_probs) * (log_probs - old_log_probs), dim=-1)
+                    backward_kl = torch.sum(torch.exp(old_log_probs) * (old_log_probs - log_probs), dim=-1)
+                    masks = {**prob_masks, **ent_masks}
+                    for name, mask in masks.items():
+                        ratios_mean = verl_F.masked_mean(ratios, mask)
+                        prob_diff_mean = verl_F.masked_mean(prob - old_prob, mask)
+                        entropy_diff_mean = verl_F.masked_mean(entropy-old_entropy, mask)
+                        old_entropy_mean = verl_F.masked_mean(old_entropy, mask)
+                        entropy_mean = verl_F.masked_mean(entropy, mask)
+                        forward_kl_mean = verl_F.masked_mean(forward_kl, mask)
+                        backward_kl_mean = verl_F.masked_mean(backward_kl, mask)
+
+                        tokens = torch.mean(mask.float())
+                        batch_metrics[f'metrics/{name}-tokens'] = tokens.detach().item()
+                        batch_metrics[f'metrics/{name}-ratio'] = ratios_mean.detach().item()
+                        batch_metrics[f'metrics/{name}-prob_diff'] = prob_diff_mean.detach().item()
+                        batch_metrics[f'metrics/{name}-old_entropy'] = old_entropy_mean.detach().item()
+                        batch_metrics[f'metrics/{name}-entropy'] = entropy_mean.detach().item()
+                        batch_metrics[f'metrics/{name}-entropy_diff'] = entropy_diff_mean.detach().item()
+                        batch_metrics[f'metrics/{name}-forward_kl'] = forward_kl_mean.detach().item()
+                        batch_metrics[f'metrics/{name}-backward_kl'] = backward_kl_mean.detach().item()
+
+                    append_to_dict(metrics, batch_metrics)
+                    break
+                break
 
         return metrics
